@@ -25,7 +25,7 @@ TEMPLATE = """
 
 def gen_page(title, links):
     items = ('<li><a href="{}">link {}</a></li>'.format(link, i)
-            for i, link in enumerate(links, start=1))
+             for i, link in enumerate(links, start=1))
     body = "<ul>{}</ul>".format("\n".join(items))
     return TEMPLATE.format(title=title, body=body)
 
@@ -39,7 +39,10 @@ def delay():
 def homepage():
     links = ["/product/{}".format(i) for i in (1, 2, 3)]
     links.append("/404")
+    links.append("/500")
     links.append("/redirect")
+    links.append("htt://google.com")
+    links.append("http://domain-that-does-not.exist")
     return gen_page("Homepage", links)
 
 
@@ -59,6 +62,11 @@ def user_page(uid):
 @app.route("/404")
 def four_oh_four():
     abort(404)
+
+
+@app.route("/500")
+def five_hundred():
+    abort(500)
 
 
 @app.route("/redirect")

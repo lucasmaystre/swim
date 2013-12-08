@@ -4,8 +4,8 @@ import mucrawl
 import re
 
 
-DEFAULT_FOLDER = "./mucrawl"
-DEFAULT_SEED = "http://127.0.0.1:5000/"
+DEFAULT_FOLDER = "./test"
+DEFAULT_SEED = u"http://127.0.0.1:5000/"
 
 URL_RE = re.compile(r'<a.*?href="(?P<url>.*?)">')
 
@@ -16,12 +16,13 @@ def process(body):
 
 
 def main(args):
+    mucrawl.set_loglevel(args.loglevel)
     if args.pickle is None:
         mgr = mucrawl.CrawlManager(args.folder, processor=process)
         mgr.run(seeds=[DEFAULT_SEED])
     else:
         mgr = mucrawl.CrawlManager(args.folder, processor=process,
-                crawler_pickle=pickle)
+                crawler_pickle=args.pickle)
         mgr.run()
 
 

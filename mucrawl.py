@@ -1,3 +1,7 @@
+"""swim - a simple web crawler.
+
+blabla.
+"""
 # In the folder, there's:
 # - the sqlite DB called `crawl.db`
 # - a folder called `data` containing called `[id].res`
@@ -9,6 +13,8 @@
 # - GET requests only - no POST, etc.
 # - Output is response body only
 # - no cookies handling, form submissions, etc.
+#
+# TODO: https://github.com/patrys/httmock
 
 import os.path
 import Queue
@@ -17,8 +23,12 @@ import urlparse
 import contextlib
 import requests
 import logging
+import sqlite3
+import datetime
+import cPickle
 
-from storm.locals import *
+from storm.locals import (Bool, DateTime, Float, Int, ReferenceSet,
+                          Store, Storm, Unicode, create_database)
 
 
 SQL_SCHEMA = """
@@ -27,8 +37,8 @@ CREATE TABLE IF NOT EXISTS resource (
   url TEXT,
   final_url TEXT,
   method TEXT,
-  created TEXT DEFAULT CURRENT_TIMESTAMP,
-  updated TEXT DEFAULT CURRENT_TIMESTAMP,
+  created TEXT DEFAULT CURRENT_TIMESTAMP,  -- UTC time.
+  updated TEXT DEFAULT CURRENT_TIMESTAMP,  -- UTC time.
   duration REAL,
   status_code INTEGER,
   successful BOOLEAN
@@ -39,22 +49,25 @@ CREATE TABLE IF NOT EXISTS edge (
   id INTEGER PRIMARY KEY,
   src INTEGER REFERENCES resource,
   dst INTEGER REFERENCES resource,
-  created TEXT DEFAULT CURRENT_TIMESTAMP,
+  created TEXT DEFAULT CURRENT_TIMESTAMP,  -- UTC time.
   new_dst BOOLEAN,
   UNIQUE (src, dst) ON CONFLICT IGNORE
 );
 """
 
-LOGGER = _setup_logger()
-LOG_FORMAT = "%(asctime)s %(name)s:%(levelname)s - %(message)s"
 
 def _setup_logger():
+    template = "%(asctime)s %(name)s:%(levelname)s - %(message)s"
     logger = logging.getLogger(__name__)
-    handler = logging.handlers.StreamHandler()  # Logs to stderr.
-    handler.setFormatter(logging.Formatter(fmt=LOG_FORMAT))
+    handler = logging.StreamHandler()  # Logs to stderr.
+    handler.setFormatter(logging.Formatter(fmt=template))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
+
+
+LOGGER = _setup_logger()
+NOTHING = object()  # Used as a sentinel for kwargs.
 
 
 def _ensure_folder(folder):
@@ -62,11 +75,11 @@ def _ensure_folder(folder):
         os.makedirs(folder)
 
 
-def set_loglevel(logevel):
+def set_loglevel(loglevel):
     if isinstance(loglevel, basestring):
         # Getting the relevant constant, e.g. `logging.DEBUG`.
         loglevel = getattr(logging, loglevel.upper())
-    LOOGGER.setLevel(loglevel)
+    LOGGER.setLevel(loglevel)
 
 
 class Resource(Storm):
@@ -77,14 +90,14 @@ class Resource(Storm):
     method = Unicode()
     created = DateTime()
     updated = DateTime()
-    duration = Int()
+    duration = Float()
     status_code = Int()
-    is_successful = Boolean(name='successful')
+    is_successful = Bool(name='successful')
     # References
     parents = ReferenceSet('Resource.id', 'Edge.dst',
-            'Edge.src', 'Resource.id')
+                           'Edge.src', 'Resource.id')
     children = ReferenceSet('Resource.id', 'Edge.src',
-            'Edge.dst', 'Resource.id')
+                            'Edge.dst', 'Resource.id')
 
     def __init__(self, url):
         self.url = url
@@ -96,11 +109,30 @@ class Edge(Storm):
     src = Int()
     dst = Int()
     created = DateTime()
-    is_new_dst = Boolean(name='new_dst')
+    is_new_dst = Bool(name='new_dst')
 
-    def __init(self, src, dst):
+    def __init__(self, src, dst):
         self.src = src
         self.dst = dst
+
+
+class MyQueue(Queue.Queue):
+    """A queue that's picklable and rate-limited."""
+    # TODO: there might be problems with `unfinished_tasks`.
+
+    def __init__(self):
+        Queue.Queue.__init__(self, maxsize=0)
+
+    def __getstate__(self):
+        items = list()
+        while not self.empty():
+            items.append(self.get_nowait())
+        return items
+
+    def __setstate__(self, state):
+        self.__init__()
+        for item in state:
+            self.put_nowait(item)
 
 
 class Worker(threading.Thread):
@@ -130,20 +162,20 @@ class Worker(threading.Thread):
                 pass
 
     def _process(self, url):
-        data = {'method': "GET"}
-        try
+        data = {'method': u"GET"}
+        try:
             response = self._session.get(url)
             data['success'] = True
             data['duration'] = response.elapsed.total_seconds()
             data['status_code'] = response.status_code
-            data['body'] = reponse.text
+            data['body'] = response.text
             data['final_url'] = response.url
         except Exception as e:
             LOGGER.warning("exception while processing URL {}: {}"
-                    .format(url, repr(e)))
+                           .format(url, repr(e)))
             data['success'] = False
         finally:
-            data['updated'] = datetime.datetime.now()
+            data['updated'] = datetime.datetime.utcnow()
             return data
 
     def shutdown(self):
@@ -155,7 +187,7 @@ class Crawler(object):
     DEFAULT_TIMEOUT = 1  # In seconds.
 
     def __init__(self, nb_workers=2, rate=None,
-            inputq=Queue.Queue(), outputq=Queue.Queue()):
+                 inputq=MyQueue(), outputq=MyQueue()):
         self._nb_workers = nb_workers
         self._rate = rate
         self._inputq = inputq
@@ -169,24 +201,26 @@ class Crawler(object):
         with open(path, 'rb') as f:
             data = cPickle.load(f)
             return cls(nb_workers=data['nb_workers'], rate=data['rate'],
-                    inputq=data['inputq'], outputq=data['outputq'])
+                       inputq=data['inputq'], outputq=data['outputq'])
 
     def add_job(self, key, url):
         self._inputq.put_nowait((key, url))
 
-    def get_result(self, block=True, timeout=self.DEFAULT_TIMEOUT):
+    def get_result(self, block=True, timeout=NOTHING):
+        if timeout is NOTHING:
+            timeout = self.DEFAULT_TIMEOUT
         return self._outputq.get(block, timeout)
 
     def start(self):
-        LOGGER.debug("starting the crawler with {} workers"
-                .format(self._nb_workers))
         assert not self._started, "crawler already started"
+        LOGGER.debug("starting the crawler with {} workers"
+                     .format(self._nb_workers))
         self._started = True
         for i in xrange(self._nb_workers):
             worker = Worker(self._inputq, self._outputq)
             self._workers.append(worker)
             worker.start()
-    
+
     def stop(self):
         assert self._started, "crawler not started"
         # Send kill signal to every worker.
@@ -202,10 +236,10 @@ class Crawler(object):
     def save_pickle(self, path):
         assert not self._started, "cannot save a running crawler"
         data = {
-          'nb_workers': self._nb_workers,
-          'rate': self._rate,
-          'inputq': self._inputq,
-          'outputq': self._outputq,
+            'nb_workers': self._nb_workers,
+            'rate': self._rate,
+            'inputq': self._inputq,
+            'outputq': self._outputq,
         }
         with open(path, 'wb') as f:
             cPickle.dump(data, f)
@@ -220,15 +254,16 @@ class CrawlManager(object):
 
     def __init__(self, folder, processor=None, crawler_pickle=None):
         _ensure_folder(folder)
-        self._conn = self._connect(os.path.join(folder, "crawl.db"))
+        self._store = self._get_store(os.path.join(folder, "crawl.db"))
         self._data_dir = os.path.join(folder, "data")
+        self._pickle_path = os.path.join(folder, "crawler.pickle")
         _ensure_folder(self._data_dir)
         self._process = processor
         if crawler_pickle is None:
-            self._crawler = Crawler(nb_workers=4, rate=1.0)
+            self._crawler = Crawler(nb_workers=2, rate=1.0)
         else:
-            self._crawler = Crawler.from_pickle(self._crawler_pickle)
-        LOGGER.debug("crawl manager initialized")
+            self._crawler = Crawler.from_pickle(crawler_pickle)
+        LOGGER.info("crawl manager initialized")
 
     def _get_store(self, db_path):
         # Initialize store. Context automatically
@@ -242,7 +277,7 @@ class CrawlManager(object):
         should_save = False
         try:
             yield crawler
-        except KeyboardInterrupt as interrupt:
+        except KeyboardInterrupt:
             LOGGER.info("caught an interruption")
             should_save = True
         except Exception as e:
@@ -250,16 +285,15 @@ class CrawlManager(object):
             LOGGER.error("crawl manager caught an exception")
             should_save = True
             raise e
-        finally
+        finally:
             crawler.stop()
             if should_save and save is not None:
                 crawler.save_pickle(save)
 
-    def run(self, seeds=())
+    def run(self, seeds=()):
         for url in seeds:
-            self._add_resource(url)
-        self._crawler.start()
-        with self._manage(self._crawler, save='crawler.pickle') as crawler:
+            self._add_resource(url, None)
+        with self._manage(self._crawler, self._pickle_path) as crawler:
             while crawler.is_working():
                 try:
                     key, res = crawler.get_result(timeout=1)
@@ -276,17 +310,18 @@ class CrawlManager(object):
             self._store.add(resource)
             self._store.flush()
             LOGGER.debug("resource {} not fetched yet, creating a new job"
-                    .format(resource.id))
+                         .format(resource.id))
             self._crawler.add_job(resource.id, url)
-        # Add an edge.
-        LOGGER.debug("adding edge between {} and {}".format(
-                parent_id, resource.id))
-        self._store.add(Edge(parent_id, resource.id))
+        if parent_id is not None:
+            # Add an edge.
+            LOGGER.debug("adding edge between {} and {}"
+                         .format(parent_id, resource.id))
+            self._store.add(Edge(parent_id, resource.id))
         self._store.commit()
 
     def _handle_result(self, key, result):
         LOGGER.debug("handling result for key {}".format(key))
-        resource = self._store.find(Resource, key)
+        resource = self._store.get(Resource, key)
         # Update the resource with the new information.
         resource.final_url = result.get('final_url')
         resource.method = result.get('method')
@@ -304,9 +339,7 @@ class CrawlManager(object):
                 f.write(result['body'])
             # Extract more jobs.
             if self._process is not None:
-                base = urlparse.urlparse(resource.final_url)
-                for url in self._process(res):
-                    parsed = urlparse.urlparse(url)
-                    if not parsed.netloc:
-                        canonical = urlparse.urlunparse(base[:2] + parsed[2:])
+                for url in self._process(result['body']):
+                    # urljoin handles all quirky cases of URL resolution.
+                    canonical = urlparse.urljoin(resource.final_url, url)
                     self._add_resource(canonical, resource.id)
