@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import argparse
-import mucrawl
+import swim
 import re
 
 
@@ -16,13 +16,13 @@ def process(body):
 
 
 def main(args):
-    mucrawl.set_loglevel(args.loglevel)
+    swim.set_loglevel(args.loglevel)
     if args.pickle is None:
-        mgr = mucrawl.CrawlManager(args.folder, processor=process)
+        mgr = swim.CrawlManager(args.folder, processor=process, rate=0.1)
         mgr.run(seeds=[DEFAULT_SEED])
     else:
-        mgr = mucrawl.CrawlManager(args.folder, processor=process,
-                crawler_pickle=args.pickle)
+        mgr = swim.CrawlManager(args.folder, processor=process,
+                                crawler_pickle=args.pickle)
         mgr.run()
 
 

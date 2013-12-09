@@ -1,12 +1,36 @@
-"""swim - a simple web crawler.
+"""swim - a simple, no-frills web crawler.
 
-blabla.
+In a nutshell: you seed it with a bunch of URLs, you give it a function that
+extracts more URLs from the HTTP responses, and swim does the rest. Noticeable
+features are:
+
+- multithreaded, possibility to enable rate limiting
+- kill the crawler and resume it later without losing data
+- all crawling-related information is persisted in a database
+
+swim is minimalistic by design. There are plenty of powerful crawlers out
+there; the goal of this one is to provide a simple, no-frills basis that is
+easy to adapt to your needs.
+
+Here's a small snipper that illustrates the API.
+
+    import re
+
+    def process(body):
+        for match in re.finditer(r'<a.*?href="(?P<url>.*?)">', body):
+            yield match.group('url')
+
+    config = {
+        'folder': "./crawl",
+        'processor': process,
+        'nb_workers': 4,
+        'rate': 2.0,
+    }
+    manager = swim.CrawlManager(**config)
+    manager.run(seeds=["http://lucas.maystre.ch/"])
 """
-# In the folder, there's:
-# - the sqlite DB called `crawl.db`
-# - a folder called `data` containing called `[id].res`
-
 # Assumptions & design decisions:
+#
 # - decoupling fetching HTML from processing the content
 # - new pages to crawl can be determined solely by processing text output
 # - page = URL + GET params.
@@ -14,18 +38,42 @@ blabla.
 # - Output is response body only
 # - no cookies handling, form submissions, etc.
 #
+# Recovery: works only if it is able to gracefully shut down. The shutdown
+# procedure is as follows:
+#
+# 1. set the shutdown flag for all worker threads.
+# 2. Wait until all threads are done. This means that they finished the pending
+#    request or that they timed out on getting a new job from the input queue.
+# 3. Process everything in the output queue, possibly adding new URls to the
+#    input queue.
+# 4. Pickle the crawler state, commit and close the DB connection.
+#
+# A wish list of things TODO:
+#
+# - recover from crashes as well as graceful shutdowns.
+# - finish crawling the URLs in the input queue without creating new jobs. To
+#   make sure we could still expand the crawl, we could add a flag in the table
+#   which indicates whether the resource has been processed (i.e. new jobs
+#   extracted) or not.
+# - clean up the queues: the output queue should not be pickled anymore (it is
+#   empty at the end), so we could just use a regular Queue.Queue for that. As
+#   for the input queue, it might be simpler and more efficient to subclass /
+#   wrap `collections.deque` which also has atomic ops.
 # TODO: https://github.com/patrys/httmock
 
+
+import contextlib
+import cPickle
+import datetime
+import logging
 import os.path
 import Queue
-import threading
-import urlparse
-import contextlib
+import random
 import requests
-import logging
 import sqlite3
-import datetime
-import cPickle
+import threading
+import time
+import urlparse
 
 from storm.locals import (Bool, DateTime, Float, Int, ReferenceSet,
                           Store, Storm, Unicode, create_database)
@@ -57,6 +105,7 @@ CREATE TABLE IF NOT EXISTS edge (
 
 
 def _setup_logger():
+    """Set up and return the logger for the module."""
     template = "%(asctime)s %(name)s:%(levelname)s - %(message)s"
     logger = logging.getLogger(__name__)
     handler = logging.StreamHandler()  # Logs to stderr.
@@ -71,11 +120,23 @@ NOTHING = object()  # Used as a sentinel for kwargs.
 
 
 def _ensure_folder(folder):
-    if not os.path.exists(folder):
+    """Make sure a given folder exists.
+
+    The given path can actually consist of a hierarchy of multiple unexisting
+    folders which will all be created.
+    """
+    if os.path.exists(folder):
+        if not os.isdir(folder):
+            raise ValueError("path exists but is not a folder")
+    else:
         os.makedirs(folder)
 
 
 def set_loglevel(loglevel):
+    """Set the level for the module-wide logger.
+
+    loglevel is a a string such as "debug", "info" or "warning".
+    """
     if isinstance(loglevel, basestring):
         # Getting the relevant constant, e.g. `logging.DEBUG`.
         loglevel = getattr(logging, loglevel.upper())
@@ -83,6 +144,9 @@ def set_loglevel(loglevel):
 
 
 class Resource(Storm):
+
+    """ORM class for the resource table."""
+
     __storm_table__ = 'resource'
     id = Int(primary=True)
     url = Unicode()
@@ -104,6 +168,9 @@ class Resource(Storm):
 
 
 class Edge(Storm):
+
+    """ORM class for the edge table."""
+
     __storm_table__ = 'edge'
     id = Int(primary=True)
     src = Int()
@@ -116,30 +183,92 @@ class Edge(Storm):
         self.dst = dst
 
 
-class MyQueue(Queue.Queue):
-    """A queue that's picklable and rate-limited."""
-    # TODO: there might be problems with `unfinished_tasks`.
+class SwimQueue(Queue.Queue):
 
-    def __init__(self):
+    """A Queue.Queue that's picklable and rate-limited.
+
+    Queue.Queue is not picklable (for good reasons). This class fixes that for
+    swim's specific use. Rate limiting is also implemented directly here; the
+    rate limit is respected over a one minute window.
+    """
+    # TODO So far this class is pretty simple. In the future, it might become
+    # better to wrap Queue.Queue (decorator pattern) instead of subclassing it.
+
+    def __init__(self, rate_limit=None):
+        """Initialize the queue.
+
+        If rate_limit is a positive number, it represents the rate (items per
+        second) at which items can be retrieved.
+        """
         Queue.Queue.__init__(self, maxsize=0)
+        self.rate_limit = rate_limit
+        self._tstamps = list()
+        self._lock = threading.Lock()
 
     def __getstate__(self):
-        items = list()
+        """Return a representation of the instance as a list."""
+        items = [self.rate_limit]
         while not self.empty():
             items.append(self.get_nowait())
         return items
 
     def __setstate__(self, state):
-        self.__init__()
+        """Restore the instance from a list representation."""
+        # First element is the rate limit, the rest are the items.
+        self.__init__(rate_limit=state.pop(0))
         for item in state:
             self.put_nowait(item)
+
+    def get(self, *args, **kwargs):
+        """Get an element from the queue."""
+        if self.rate_limit is None:
+            return Queue.Queue.get(self, *args, **kwargs)
+        # Otherwise, bring out the heavy artillery.
+        self._lock.acquire()
+        try:
+            minute_ago = (datetime.datetime.utcnow()
+                          - datetime.timedelta(minutes=1))
+            # Remove outdated timestamps.
+            while self._tstamps and self._tstamps[0] < minute_ago:
+                self._tstamps.pop(0)
+            # Check the rate averaged over the last minute.
+            LOGGER.debug("---- len: {}".format(len(self._tstamps)))
+            if len(self._tstamps) / 60.0 > self.rate_limit:
+                raise RateLimitExceeded()
+            else:
+                item = Queue.Queue.get(self, *args, **kwargs)
+                self._tstamps.append(datetime.datetime.utcnow())
+                return item
+        finally:
+            self._lock.release()
+
+    def sleep_a_little(self):
+        """Sleep for a little while.
+
+        The sleep time is picked uniformly at random between 0 and the inverse
+        of the rate limit. This helps avoiding oscillations. It's the
+        responsibility of the queue user to call this function.
+        """
+        time.sleep(random.uniform(0, 1.0 / self.rate_limit))
+
+
+class RateLimitExceeded(Exception):
+    """Exception raised by SwimQueue."""
+    pass
 
 
 class Worker(threading.Thread):
 
+    """Worker thread.
+
+    A worker fetches jobs from the input queue, performs the HTTP request, and
+    puts the result in the output queue.
+    """
+
     INPUT_TIMEOUT = 1  # In seconds.
 
     def __init__(self, inputq, outputq):
+        """Initialize the thread with two queues."""
         threading.Thread.__init__(self)
         self._inputq = inputq
         self._outputq = outputq
@@ -148,6 +277,7 @@ class Worker(threading.Thread):
         LOGGER.debug('initializing worker thread')
 
     def run(self):
+        """Fetch jobs from the input queue ad infinitum."""
         while not self._shutdown:
             self._is_working = False
             try:
@@ -158,12 +288,16 @@ class Worker(threading.Thread):
                 # Mark the task as done.
                 self._inputq.task_done()
                 LOGGER.debug("{}: done with job {}".format(self.name, key))
+            except RateLimitExceeded:
+                self._inputq.sleep_a_little()
             except Queue.Empty:
                 pass
 
     def _process(self, url):
+        """Process a single url: fetch it and parse the results."""
         data = {'method': u"GET"}
         try:
+            LOGGER.info("fetching '{}'...".format(url))
             response = self._session.get(url)
             data['success'] = True
             data['duration'] = response.elapsed.total_seconds()
@@ -179,18 +313,31 @@ class Worker(threading.Thread):
             return data
 
     def shutdown(self):
+        """Set the shutdown flag.
+
+        The thread will exit only once it has finished processing any pending
+        job.
+        """
         self._shutdown = True
 
 
 class Crawler(object):
 
+    """Multi-threaded crawler.
+
+    The crawler handles and coordinates several worker threads, and contains
+    functions to pickle / unpickle the state. It also abstracts away the input
+    and output queues.
+    """
+
     DEFAULT_TIMEOUT = 1  # In seconds.
 
     def __init__(self, nb_workers=2, rate=None,
-                 inputq=MyQueue(), outputq=MyQueue()):
+                 inputq=None, outputq=SwimQueue()):
+        """Initialize a crawler."""
         self._nb_workers = nb_workers
         self._rate = rate
-        self._inputq = inputq
+        self._inputq = inputq if inputq is not None else SwimQueue(rate)
         self._outputq = outputq
         self._workers = list()
         self._started = False
@@ -198,20 +345,31 @@ class Crawler(object):
 
     @classmethod
     def from_pickle(cls, path):
+        """Recreate a crawler from a pickle."""
         with open(path, 'rb') as f:
             data = cPickle.load(f)
             return cls(nb_workers=data['nb_workers'], rate=data['rate'],
                        inputq=data['inputq'], outputq=data['outputq'])
 
     def add_job(self, key, url):
+        """Add a URL to crawl.
+
+        The key paramater allows to maps URLs to responses when fetching
+        elements from the output queue.
+        """
         self._inputq.put_nowait((key, url))
 
     def get_result(self, block=True, timeout=NOTHING):
+        """Fetch a result from the output queue.
+
+        Returns a tuple (key, response) to facilitate mapping with the
+        corresponding URL / request."""
         if timeout is NOTHING:
             timeout = self.DEFAULT_TIMEOUT
         return self._outputq.get(block, timeout)
 
     def start(self):
+        """Launch the worker threads and start crawling."""
         assert not self._started, "crawler already started"
         LOGGER.debug("starting the crawler with {} workers"
                      .format(self._nb_workers))
@@ -222,6 +380,12 @@ class Crawler(object):
             worker.start()
 
     def stop(self):
+        """Shut the crawler down.
+
+        This might take some time, as we wait until every worker thread has
+        finished what it was currently doing (typically performing an HTTP
+        request.) Think of this as a graceful shutdown.
+        """
         assert self._started, "crawler not started"
         # Send kill signal to every worker.
         for worker in self._workers:
@@ -234,6 +398,7 @@ class Crawler(object):
         self._started = False
 
     def save_pickle(self, path):
+        """Save the state of the crawler as a pickle."""
         assert not self._started, "cannot save a running crawler"
         data = {
             'nb_workers': self._nb_workers,
@@ -246,13 +411,38 @@ class Crawler(object):
         LOGGER.debug("crawler setup saved as a pickle")
 
     def is_working(self):
+        """Check whether there are still crawls pending."""
         # I'm not sure that this is part of the official Queue.Queue API.
         return self._inputq.unfinished_tasks > 0
 
 
 class CrawlManager(object):
 
-    def __init__(self, folder, processor=None, crawler_pickle=None):
+    """Manage the crawler.
+
+    The crawler simply takes URLs and returns HTTP responses. This class does
+    the rest: keep track of requests in the database, write responses to disk,
+    send new URLs to the crawler based on the responses, and listen to keyboard
+    interrupts.
+
+    In principle, this should be the only class of the module that gets called
+    in user code. The rest is just here to support this one.
+    """
+
+    def __init__(self, folder="./swim", processor=None, crawler_pickle=None,
+                 nb_workers=2, rate=1.0):
+        """Initialize a crawl manager.
+
+        Keyword arguments:
+        folder -- the folder where the output will be stored (default './swim')
+        processor -- a function that takes a string containing the response
+                body and returns an iterable over URLs (default None)
+        crawler_pickle -- a pickle used to resume a previous crawl, overrides
+                the next two arguments (default None)
+        nb_workers -- the number of worker threads to spawn (default 2)
+        rate -- the rate (averaged over one minute) at which to crawl, in URLs
+                per second (default 1.0)
+        """
         _ensure_folder(folder)
         self._store = self._get_store(os.path.join(folder, "crawl.db"))
         self._data_dir = os.path.join(folder, "data")
@@ -260,19 +450,26 @@ class CrawlManager(object):
         _ensure_folder(self._data_dir)
         self._process = processor
         if crawler_pickle is None:
-            self._crawler = Crawler(nb_workers=2, rate=1.0)
+            self._crawler = Crawler(nb_workers=nb_workers, rate=rate)
         else:
             self._crawler = Crawler.from_pickle(crawler_pickle)
         LOGGER.info("crawl manager initialized")
 
     def _get_store(self, db_path):
-        # Initialize store. Context automatically
+        """Return a storm Store from a path."""
+        # Initialize store. Context automatically commits and closes.
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
             conn.executescript(SQL_SCHEMA)
         return Store(create_database("sqlite:{}".format(db_path)))
 
     @contextlib.contextmanager
     def _manage(self, crawler, save=None):
+        """Manage interruptions and exceptions.
+
+        This is a context manager that wraps around the crawl manager's
+        operations and takes care of handling exceptions and trying to
+        gracefully shut down (and save) the crawler.
+        """
         crawler.start()
         should_save = False
         try:
@@ -287,25 +484,47 @@ class CrawlManager(object):
             raise e
         finally:
             crawler.stop()
+            try:
+                # Process everything in the output queue.
+                while True:
+                    key, res = crawler.get_result(block=False)
+                    self._handle_result(key, res)
+            except Queue.Empty:
+                pass
             if should_save and save is not None:
                 crawler.save_pickle(save)
 
     def run(self, seeds=()):
+        """Start crawling.
+
+        If we are not resuming a previous crawl, we will typically need to
+        provide a few seeds to bootstrap the crawler.
+        """
         for url in seeds:
             self._add_resource(url, None)
         with self._manage(self._crawler, self._pickle_path) as crawler:
             while crawler.is_working():
+                # This is the main loop: wait for results and process them.
                 try:
                     key, res = crawler.get_result(timeout=1)
                 except Queue.Empty:
-                    continue
-                self._handle_result(key, res)
+                    pass
+                else:
+                    self._handle_result(key, res)
+        self._store.commit()
+        self._store.close()
         LOGGER.info("crawl manager has finished")
 
     def _add_resource(self, url, parent_id):
+        """Handle a URL output by the processor.
+
+        Finds out whether the URL is already in the database and inserts it if
+        necessary, creates an edge with its parent resource, and adds it to the
+        crawler job queue if needed.
+        """
         resource = self._store.find(Resource, Resource.url == url).one()
         if resource is None:
-            # We've never seent this URL---we need to crawl it.
+            # We've never seen this URL---we need to crawl it.
             resource = Resource(url)
             self._store.add(resource)
             self._store.flush()
@@ -320,6 +539,11 @@ class CrawlManager(object):
         self._store.commit()
 
     def _handle_result(self, key, result):
+        """Handle a result (HTTP response) from the crawler.
+
+        Includes updating the corresponding entry in the database, writing the
+        response to disk, and extracting further URLs to crawl.
+        """
         LOGGER.debug("handling result for key {}".format(key))
         resource = self._store.get(Resource, key)
         # Update the resource with the new information.
@@ -332,7 +556,8 @@ class CrawlManager(object):
         self._store.commit()
         # Process the body of the response, if there is one.
         if 'body' in result and result['body'] is not None:
-            LOGGER.debug("writing response body to disk for key {}".format(key))
+            LOGGER.debug("writing response body to disk for key {}"
+                         .format(key))
             # Save the file to disk.
             path = os.path.join(self._data_dir, "{}.html".format(resource.id))
             with open(path, 'w') as f:
