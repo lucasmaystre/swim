@@ -68,7 +68,6 @@ import datetime
 import logging
 import os.path
 import Queue
-import random
 import requests
 import sqlite3
 import threading
@@ -116,7 +115,6 @@ def _setup_logger():
 
 
 LOGGER = _setup_logger()
-NOTHING = object()  # Used as a sentinel for kwargs.
 
 
 def _ensure_folder(folder):
@@ -126,7 +124,7 @@ def _ensure_folder(folder):
     folders which will all be created.
     """
     if os.path.exists(folder):
-        if not os.isdir(folder):
+        if not os.path.isdir(folder):
             raise ValueError("path exists but is not a folder")
     else:
         os.makedirs(folder)
@@ -203,13 +201,13 @@ class SwimQueue(Queue.Queue):
         Queue.Queue.__init__(self, maxsize=0)
         self.rate_limit = rate_limit
         self._tstamps = list()
-        self._lock = threading.Lock()
+        self._cond = threading.Condition(threading.Lock())
 
     def __getstate__(self):
         """Return a representation of the instance as a list."""
         items = [self.rate_limit]
         while not self.empty():
-            items.append(self.get_nowait())
+            items.append(self._get())
         return items
 
     def __setstate__(self, state):
@@ -217,44 +215,48 @@ class SwimQueue(Queue.Queue):
         # First element is the rate limit, the rest are the items.
         self.__init__(rate_limit=state.pop(0))
         for item in state:
-            self.put_nowait(item)
+            self._put(item)
+            self.unfinished_tasks += 1
 
-    def get(self, *args, **kwargs):
+    def get(self, timeout):
         """Get an element from the queue."""
+        assert timeout > 0, "timeout must be positive"
         if self.rate_limit is None:
-            return Queue.Queue.get(self, *args, **kwargs)
+            return Queue.Queue.get(self, timeout=timeout)
         # Otherwise, bring out the heavy artillery.
-        self._lock.acquire()
-        try:
-            minute_ago = (datetime.datetime.utcnow()
-                          - datetime.timedelta(minutes=1))
-            # Remove outdated timestamps.
-            while self._tstamps and self._tstamps[0] < minute_ago:
-                self._tstamps.pop(0)
-            # Check the rate averaged over the last minute.
-            LOGGER.debug("---- len: {}".format(len(self._tstamps)))
-            if len(self._tstamps) / 60.0 > self.rate_limit:
-                raise RateLimitExceeded()
-            else:
-                item = Queue.Queue.get(self, *args, **kwargs)
-                self._tstamps.append(datetime.datetime.utcnow())
-                return item
-        finally:
-            self._lock.release()
+        with self._cond:
+            success = False
+            while not success and timeout > 0:
+                waiting_time = self._waiting_time()
+                if waiting_time > 0:
+                    start = time.time()
+                    self._cond.wait(min(waiting_time, timeout))
+                    timeout -= time.time() - start
+                else:
+                    # TODO Big flaw: we have no idea whether / when the
+                    # subsequent call to Queue.Queue.get() will return
+                    # something! What a mess...
+                    self._tstamps.append(datetime.datetime.utcnow())
+                    success = True
+        if success:
+            return Queue.Queue.get(self, timeout=timeout)
+        else:
+            raise Queue.Empty()
 
-    def sleep_a_little(self):
-        """Sleep for a little while.
-
-        The sleep time is picked uniformly at random between 0 and the inverse
-        of the rate limit. This helps avoiding oscillations. It's the
-        responsibility of the queue user to call this function.
-        """
-        time.sleep(random.uniform(0, 1.0 / self.rate_limit))
-
-
-class RateLimitExceeded(Exception):
-    """Exception raised by SwimQueue."""
-    pass
+    def _waiting_time(self):
+        """Compute the time remaining until the next element can be fetched."""
+        assert self.rate_limit > 0, "rate limit must be positive"
+        minute_ago = (datetime.datetime.utcnow()
+                      - datetime.timedelta(minutes=1))
+        # Remove outdated timestamps.
+        while self._tstamps and self._tstamps[0] < minute_ago:
+            self._tstamps.pop(0)
+        max_len = int(self.rate_limit * 60)  # has to be *smaller or equal*.
+        if len(self._tstamps) > max_len:
+            delta = self._tstamps[-(max_len + 1)] - minute_ago
+            return delta.total_seconds()
+        else:
+            return 0
 
 
 class Worker(threading.Thread):
@@ -288,8 +290,6 @@ class Worker(threading.Thread):
                 # Mark the task as done.
                 self._inputq.task_done()
                 LOGGER.debug("{}: done with job {}".format(self.name, key))
-            except RateLimitExceeded:
-                self._inputq.sleep_a_little()
             except Queue.Empty:
                 pass
 
@@ -330,15 +330,12 @@ class Crawler(object):
     and output queues.
     """
 
-    DEFAULT_TIMEOUT = 1  # In seconds.
-
-    def __init__(self, nb_workers=2, rate=None,
-                 inputq=None, outputq=SwimQueue()):
+    def __init__(self, nb_workers=2, rate=None, inputq=None):
         """Initialize a crawler."""
         self._nb_workers = nb_workers
         self._rate = rate
         self._inputq = inputq if inputq is not None else SwimQueue(rate)
-        self._outputq = outputq
+        self._outputq = Queue.Queue()
         self._workers = list()
         self._started = False
         LOGGER.debug('initializing crawler')
@@ -349,7 +346,7 @@ class Crawler(object):
         with open(path, 'rb') as f:
             data = cPickle.load(f)
             return cls(nb_workers=data['nb_workers'], rate=data['rate'],
-                       inputq=data['inputq'], outputq=data['outputq'])
+                       inputq=data['inputq'])
 
     def add_job(self, key, url):
         """Add a URL to crawl.
@@ -359,13 +356,11 @@ class Crawler(object):
         """
         self._inputq.put_nowait((key, url))
 
-    def get_result(self, block=True, timeout=NOTHING):
+    def get_result(self, block=True, timeout=None):
         """Fetch a result from the output queue.
 
         Returns a tuple (key, response) to facilitate mapping with the
         corresponding URL / request."""
-        if timeout is NOTHING:
-            timeout = self.DEFAULT_TIMEOUT
         return self._outputq.get(block, timeout)
 
     def start(self):
@@ -398,22 +393,22 @@ class Crawler(object):
         self._started = False
 
     def save_pickle(self, path):
-        """Save the state of the crawler as a pickle."""
+        """Save the remaining jobs of the crawler as a pickle."""
         assert not self._started, "cannot save a running crawler"
         data = {
             'nb_workers': self._nb_workers,
             'rate': self._rate,
             'inputq': self._inputq,
-            'outputq': self._outputq,
         }
         with open(path, 'wb') as f:
             cPickle.dump(data, f)
         LOGGER.debug("crawler setup saved as a pickle")
 
     def is_working(self):
-        """Check whether there are still crawls pending."""
+        """Check whether the crawler is still actively crawling."""
+        nb_alive = len(filter(lambda w: w.is_alive(), self._workers))
         # I'm not sure that this is part of the official Queue.Queue API.
-        return self._inputq.unfinished_tasks > 0
+        return nb_alive > 0 and self._inputq.unfinished_tasks > 0
 
 
 class CrawlManager(object):
