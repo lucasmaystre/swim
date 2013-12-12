@@ -201,7 +201,7 @@ class SwimQueue(Queue.Queue):
         Queue.Queue.__init__(self, maxsize=0)
         self.rate_limit = rate_limit
         self._tstamps = list()
-        self._cond = threading.Condition(threading.Lock())
+        self._lock = threading.Lock()
 
     def __getstate__(self):
         """Return a representation of the instance as a list."""
@@ -219,44 +219,35 @@ class SwimQueue(Queue.Queue):
             self.unfinished_tasks += 1
 
     def get(self, timeout):
-        """Get an element from the queue."""
-        assert timeout > 0, "timeout must be positive"
+        """Get an element from the queue.
+
+        An item is returned if and only if 1) the caller can acquire the lock,
+        2) the rate limit is not exceeded and 3) there is an element in the
+        queue. In any other case, the call blocks for timeout seconds and
+        raises Queue.Empty.
+        """
+        assert timeout >= 0, "timeout must be non-negative"
         if self.rate_limit is None:
             return Queue.Queue.get(self, timeout=timeout)
-        # Otherwise, bring out the heavy artillery.
-        with self._cond:
-            success = False
-            while not success and timeout > 0:
-                waiting_time = self._waiting_time()
-                if waiting_time > 0:
-                    start = time.time()
-                    self._cond.wait(min(waiting_time, timeout))
-                    timeout -= time.time() - start
-                else:
-                    # TODO Big flaw: we have no idea whether / when the
-                    # subsequent call to Queue.Queue.get() will return
-                    # something! What a mess...
-                    self._tstamps.append(datetime.datetime.utcnow())
-                    success = True
-        if success:
-            return Queue.Queue.get(self, timeout=timeout)
-        else:
-            raise Queue.Empty()
+        if self._lock.acquire(False):
+            try:
+                if not self._rate_limit_exceeded():
+                    item = Queue.Queue.get(self, timeout=timeout)
+                    self._tstamps.append(time.time())
+                    return item
+            finally:
+                self._lock.release()
+        time.sleep(timeout)
+        raise Queue.Empty()
 
-    def _waiting_time(self):
+    def _rate_limit_exceeded(self):
         """Compute the time remaining until the next element can be fetched."""
         assert self.rate_limit > 0, "rate limit must be positive"
-        minute_ago = (datetime.datetime.utcnow()
-                      - datetime.timedelta(minutes=1))
+        minute_ago = time.time() - 60
         # Remove outdated timestamps.
         while self._tstamps and self._tstamps[0] < minute_ago:
             self._tstamps.pop(0)
-        max_len = int(self.rate_limit * 60)  # has to be *smaller or equal*.
-        if len(self._tstamps) > max_len:
-            delta = self._tstamps[-(max_len + 1)] - minute_ago
-            return delta.total_seconds()
-        else:
-            return 0
+        return len(self._tstamps) / 60.00 >= self.rate_limit
 
 
 class Worker(threading.Thread):
