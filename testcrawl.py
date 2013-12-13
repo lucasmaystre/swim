@@ -18,18 +18,18 @@ def process(body):
 def main(args):
     swim.set_loglevel(args.loglevel)
     if args.pickle is None:
-        mgr = swim.CrawlManager(args.folder, processor=process, rate=0.1)
+        mgr = swim.Manager(args.folder, processor=process, rate=0.2)
         mgr.run(seeds=[DEFAULT_SEED])
     else:
-        mgr = swim.CrawlManager(args.folder, processor=process,
-                                crawler_pickle=args.pickle)
+        mgr = swim.Manager(args.folder, processor=process,
+                           fetcher_pickle=args.pickle)
         mgr.run()
 
 
 def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--loglevel', choices=('DEBUG', 'INFO', 'WARNING'),
-        default='DEBUG')
+                        default='DEBUG')
     parser.add_argument('--folder', default=DEFAULT_FOLDER)
     parser.add_argument('--pickle', default=None)
     parser.add_argument('--seed', default=DEFAULT_SEED)

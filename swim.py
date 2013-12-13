@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """swim - a simple, no-frills web crawler.
 
 In a nutshell: you seed it with a bunch of URLs, you give it a function that
@@ -15,6 +16,7 @@ easy to adapt to your needs.
 Here's a small snipper that illustrates the API.
 
     import re
+    import swim
 
     def process(body):
         for match in re.finditer(r'<a.*?href="(?P<url>.*?)">', body):
@@ -23,16 +25,16 @@ Here's a small snipper that illustrates the API.
     config = {
         'folder': "./crawl",
         'processor': process,
-        'nb_workers': 4,
+        'max_workers': 4,
         'rate': 2.0,
     }
-    manager = swim.CrawlManager(**config)
+    manager = swim.Manager(**config)
     manager.run(seeds=["http://lucas.maystre.ch/"])
 """
 # Assumptions & design decisions:
 #
-# - decoupling fetching HTML from processing the content
-# - new pages to crawl can be determined solely by processing text output
+# - decoupling fetching URLs from processing the content
+# - new URLs to fetch can be determined solely by processing HTML output
 # - page = URL + GET params.
 # - GET requests only - no POST, etc.
 # - Output is response body only
@@ -41,12 +43,13 @@ Here's a small snipper that illustrates the API.
 # Recovery: works only if it is able to gracefully shut down. The shutdown
 # procedure is as follows:
 #
-# 1. set the shutdown flag for all worker threads.
-# 2. Wait until all threads are done. This means that they finished the pending
-#    request or that they timed out on getting a new job from the input queue.
+# 1. Set the shutdown flag and stop submitting new jobs to the executor.
+# 2. Wait until all jobs submitted to the executor are done (handled by a
+#    context manager.) This means that all pending requests are finished.
 # 3. Process everything in the output queue, possibly adding new URls to the
 #    input queue.
-# 4. Pickle the crawler state, commit and close the DB connection.
+# 4. Pickle the state of the fetcher (input queue + initialization params),
+#    commit and close the DB connection.
 #
 # A wish list of things TODO:
 #
@@ -65,6 +68,7 @@ Here's a small snipper that illustrates the API.
 import contextlib
 import cPickle
 import datetime
+import futures
 import logging
 import os.path
 import Queue
@@ -181,48 +185,121 @@ class Edge(Storm):
         self.dst = dst
 
 
-class Worker(threading.Thread):
+class Fetcher(threading.Thread):
 
-    """Worker thread.
+    """Concurrent URL fetcher.
 
-    A worker fetches jobs from the input queue, performs the HTTP request, and
-    puts the result in the output queue.
+    The fetcher takes care of performing the HTTP URLs. It enforces a rate
+    limit, but if requests takes time it can also fetch several URLs in
+    parallel. It can be stopped / resumed thanks to functions that pickle /
+    unpickle its state.
     """
 
     TIMEOUT = 1  # In seconds.
 
-    def __init__(self, inputq, outputq, interval=None):
-        """Initialize the thread with two queues."""
-        threading.Thread.__init__(self)
-        self._inputq = inputq
-        self._outputq = outputq
+    def __init__(self, max_workers=2, rate=100):
+        """Initialize a fetcher."""
+        super(Fetcher, self).__init__()
+        self._max_workers = max_workers
+        self._rate = rate
+        self._in = Queue.Queue()
+        self._out = Queue.Queue()
         self._shutdown = False
         self._session = requests.Session()
-        self._interval = interval
-        LOGGER.debug('initializing worker thread')
+        if max_workers > requests.adapters.DEFAULT_POOLSIZE:
+            # This is need as self._session might be called concurrently. See:
+            # https://github.com/ross/requests-futures.
+            kwargs = {'pool_connections': max_workers,
+                      'pool_maxsize': max_workers}
+            self._session._mount('https://',
+                                 requests.adapters.HTTPAdapter(**kwargs))
+            self._session._mount('http://',
+                                 requests.adapters.HTTPAdapter(**kwargs))
+        LOGGER.debug('fetcher initialized')
+
+    @classmethod
+    def from_pickle(cls, path):
+        """Recreate a fetcher from a pickle."""
+        with open(path, 'rb') as f:
+            data = cPickle.load(f)
+            instance = cls(max_workers=data['max_workers'], rate=data['rate'])
+            for key, url in data['pending']:
+                instance.add_url(key, url)
+            return instance
+
+    def add_url(self, key, url):
+        """Add a URL to fetch.
+
+        The key paramater allows to maps URLs to responses when fetching
+        elements from the output queue.
+        """
+        self._in.put_nowait((key, url))
+
+    def get_result(self, block=True, timeout=None):
+        """Fetch a result from the output queue.
+
+        Returns a tuple (key, response) to facilitate mapping with the
+        corresponding URL / request.
+        """
+        return self._out.get(block, timeout)
+
+    def stop(self):
+        """Gracefully shut down the fetcher.
+
+        Blocks until all pending requests are done. This method can be called
+        only once the fetcher has started.
+        """
+        assert self.is_alive(), "fetcher is not running."
+        self._shutdown = True
+        LOGGER.debug("Stopping the fetcher...")
+        self.join()
+
+    def save_pickle(self, path):
+        """Save remaining URLs and fetcher parameters as a pickle."""
+        assert not self.is_alive(), "cannot save a running fetcher"
+        self._in.put('♥')  # Small hack to be able to iterate over a queue.
+        data = {
+            'max_workers': self._max_workers,
+            'rate': self._rate,
+            'pending': list(iter(self._in.get_nowait, '♥')),
+        }
+        with open(path, 'wb') as f:
+            cPickle.dump(data, f)
+        LOGGER.debug("fetcher setup saved as a pickle")
+
+    def is_working(self):
+        """Check whether the fetcher is still actively fetching."""
+        # I'm not sure that this is part of the official Queue.Queue API.
+        return self._in.unfinished_tasks > 0
 
     def run(self):
-        """Fetch jobs from the input queue ad infinitum."""
-        while not self._shutdown:
-            start = time.time()
-            try:
-                key, url = self._inputq.get(timeout=self.TIMEOUT)
-                LOGGER.debug("{}: got job {} ({})".format(self.name, key, url))
-                result = self._process(url)
-                self._outputq.put_nowait((key, result))
-                # Mark the task as done.
-                self._inputq.task_done()
-                LOGGER.debug("{}: done with job {}".format(self.name, key))
-            except Queue.Empty:
-                pass
-            # Before fetching the next job, sleep a little.
-            elapsed = time.time() - start
-            while not self._shutdown and self._interval > elapsed:
-                time.sleep(min(self._interval - elapsed, self.TIMEOUT))
-                elapsed = time.time() - start
+        LOGGER.debug("starting the fetcher with max {} workers"
+                     .format(self._max_workers))
+        kwargs = {'max_workers': self._max_workers}
+        with futures.ThreadPoolExecutor(**kwargs) as executor:
+            pending = list()
+            while not self._shutdown:
+                # Update pending jobs.
+                pending = filter(lambda f: not f.done(), pending)
+                if len(pending) < self._max_workers:
+                    try:
+                        key, url = self._in.get(timeout=self.TIMEOUT)
+                        LOGGER.debug("processing job {} ({})".format(key, url))
+                        future = executor.submit(self._fetch, key, url)
+                        pending.append(future)
+                    except Queue.Empty:
+                        pass
+                    if self._rate is not None:
+                        time.sleep(1.0 / self._rate)
+                else:
+                    futures.wait(pending, return_when=futures.FIRST_COMPLETED)
 
-    def _process(self, url):
-        """Process a single url: fetch it and parse the results."""
+    def _fetch(self, key, url):
+        """Fetch a URL and parse the response.
+
+        Also, notify the input queue that the task is done, and put the parsed
+        reponse in the output queue.
+        """
         data = {'method': u"GET"}
         try:
             LOGGER.info("fetching '{}'...".format(url))
@@ -238,154 +315,48 @@ class Worker(threading.Thread):
             data['success'] = False
         finally:
             data['updated'] = datetime.datetime.utcnow()
-            return data
-
-    def shutdown(self):
-        """Set the shutdown flag.
-
-        The thread will exit only once it has finished processing any pending
-        job.
-        """
-        self._shutdown = True
+            self._out.put_nowait((key, data))
+            self._in.task_done()
+            LOGGER.debug("done with job {}".format(key))
 
 
-class Crawler(object):
+class Manager(object):
 
-    """Multi-threaded crawler.
+    """Manage a fetcher.
 
-    The crawler handles and coordinates several worker threads, and contains
-    functions to pickle / unpickle the state. It also abstracts away the input
-    and output queues.
-    """
-
-    def __init__(self, nb_workers=2, rate=None):
-        """Initialize a crawler."""
-        self._nb_workers = nb_workers
-        self._rate = float(rate)
-        self._inputq = Queue.Queue()
-        self._outputq = Queue.Queue()
-        self._workers = list()
-        self._started = False
-        LOGGER.debug('initializing crawler')
-
-    @classmethod
-    def from_pickle(cls, path):
-        """Recreate a crawler from a pickle."""
-        with open(path, 'rb') as f:
-            data = cPickle.load(f)
-            instance = cls(nb_workers=data['nb_workers'], rate=data['rate'])
-            for key, url in data['pending']:
-                instance.add_job(key, url)
-            return instance
-
-    def add_job(self, key, url):
-        """Add a URL to crawl.
-
-        The key paramater allows to maps URLs to responses when fetching
-        elements from the output queue.
-        """
-        self._inputq.put_nowait((key, url))
-
-    def get_result(self, block=True, timeout=None):
-        """Fetch a result from the output queue.
-
-        Returns a tuple (key, response) to facilitate mapping with the
-        corresponding URL / request."""
-        return self._outputq.get(block, timeout)
-
-    def start(self):
-        """Launch the worker threads and start crawling."""
-        assert not self._started, "crawler already started"
-        LOGGER.debug("starting the crawler with {} workers"
-                     .format(self._nb_workers))
-        self._started = True
-        interval = self._nb_workers / self._rate
-        for i in xrange(self._nb_workers):
-            worker = Worker(self._inputq, self._outputq, interval)
-            self._workers.append(worker)
-            worker.start()
-
-    def stop(self):
-        """Shut the crawler down.
-
-        This might take some time, as we wait until every worker thread has
-        finished what it was currently doing (typically performing an HTTP
-        request.) Think of this as a graceful shutdown.
-        """
-        assert self._started, "crawler not started"
-        # Send kill signal to every worker.
-        for worker in self._workers:
-            worker.shutdown()
-        # Wait for all workers to finish.
-        for worker in self._workers:
-            LOGGER.debug("stopping worker {}...".format(worker.name))
-            worker.join()
-        LOGGER.info("all workers stopped")
-        self._started = False
-
-    def save_pickle(self, path):
-        """Save the remaining jobs of the crawler as a pickle."""
-        assert not self._started, "cannot save a running crawler"
-        pending = list()
-        try:
-            while True:
-                pending.append(self._inputq.get_nowait())
-        except Queue.Empty:
-            pass
-        data = {
-            'nb_workers': self._nb_workers,
-            'rate': self._rate,
-            'pending': pending,
-        }
-        with open(path, 'wb') as f:
-            cPickle.dump(data, f)
-        LOGGER.debug("crawler setup saved as a pickle")
-
-    def is_working(self):
-        """Check whether the crawler is still actively crawling."""
-        nb_alive = len(filter(lambda w: w.is_alive(), self._workers))
-        # I'm not sure that this is part of the official Queue.Queue API.
-        return nb_alive > 0 and self._inputq.unfinished_tasks > 0
-
-
-class CrawlManager(object):
-
-    """Manage the crawler.
-
-    The crawler simply takes URLs and returns HTTP responses. This class does
+    The fetcher simply takes URLs and returns HTTP responses. This class does
     the rest: keep track of requests in the database, write responses to disk,
-    send new URLs to the crawler based on the responses, and listen to keyboard
+    send new URLs to the fetcher based on the responses, and listen to keyboard
     interrupts.
 
     In principle, this should be the only class of the module that gets called
     in user code. The rest is just here to support this one.
     """
 
-    def __init__(self, folder="./swim", processor=None, crawler_pickle=None,
-                 nb_workers=2, rate=1.0):
+    def __init__(self, folder="./swim", processor=None, fetcher_pickle=None,
+                 max_workers=2, rate=1.0):
         """Initialize a crawl manager.
 
         Keyword arguments:
         folder -- the folder where the output will be stored (default './swim')
         processor -- a function that takes a string containing the response
                 body and returns an iterable over URLs (default None)
-        crawler_pickle -- a pickle used to resume a previous crawl, overrides
+        fetcher_pickle -- a pickle used to resume a previous crawl, overrides
                 the next two arguments (default None)
-        nb_workers -- the number of worker threads to spawn (default 2)
-        rate -- the rate (averaged over one minute) at which to crawl, in URLs
-                per second (default 1.0)
+        max_workers -- the maximum number of worker threads to spawn (default 2)
+        rate -- the rate at which to crawl, in URLs per second (default 1.0)
         """
         _ensure_folder(folder)
         self._store = self._get_store(os.path.join(folder, "crawl.db"))
         self._data_dir = os.path.join(folder, "data")
-        self._pickle_path = os.path.join(folder, "crawler.pickle")
+        self._pickle_path = os.path.join(folder, "fetcher.pickle")
         _ensure_folder(self._data_dir)
         self._process = processor
-        if crawler_pickle is None:
-            self._crawler = Crawler(nb_workers=nb_workers, rate=rate)
+        if fetcher_pickle is None:
+            self._fetcher = Fetcher(max_workers=max_workers, rate=rate)
         else:
-            self._crawler = Crawler.from_pickle(crawler_pickle)
-        LOGGER.info("crawl manager initialized")
+            self._fetcher = Fetcher.from_pickle(fetcher_pickle)
+        LOGGER.info("manager initialized")
 
     def _get_store(self, db_path):
         """Return a storm Store from a path."""
@@ -395,17 +366,17 @@ class CrawlManager(object):
         return Store(create_database("sqlite:{}".format(db_path)))
 
     @contextlib.contextmanager
-    def _manage(self, crawler, save=None):
+    def _manage(self, fetcher, save=None):
         """Manage interruptions and exceptions.
 
         This is a context manager that wraps around the crawl manager's
         operations and takes care of handling exceptions and trying to
-        gracefully shut down (and save) the crawler.
+        gracefully shut down (and save) the fetcher.
         """
-        crawler.start()
+        fetcher.start()
         should_save = False
         try:
-            yield crawler
+            yield fetcher
         except KeyboardInterrupt:
             LOGGER.info("caught an interruption")
             should_save = True
@@ -415,30 +386,30 @@ class CrawlManager(object):
             should_save = True
             raise e
         finally:
-            crawler.stop()
+            fetcher.stop()
             try:
                 # Process everything in the output queue.
                 while True:
-                    key, res = crawler.get_result(block=False)
+                    key, res = fetcher.get_result(block=False)
                     self._handle_result(key, res)
             except Queue.Empty:
                 pass
             if should_save and save is not None:
-                crawler.save_pickle(save)
+                fetcher.save_pickle(save)
 
     def run(self, seeds=()):
         """Start crawling.
 
         If we are not resuming a previous crawl, we will typically need to
-        provide a few seeds to bootstrap the crawler.
+        provide a few seeds to bootstrap the fetcher.
         """
         for url in seeds:
             self._add_resource(url, None)
-        with self._manage(self._crawler, self._pickle_path) as crawler:
-            while crawler.is_working():
+        with self._manage(self._fetcher, self._pickle_path) as fetcher:
+            while fetcher.is_working():
                 # This is the main loop: wait for results and process them.
                 try:
-                    key, res = crawler.get_result(timeout=1)
+                    key, res = fetcher.get_result(timeout=1)
                 except Queue.Empty:
                     pass
                 else:
@@ -452,7 +423,7 @@ class CrawlManager(object):
 
         Finds out whether the URL is already in the database and inserts it if
         necessary, creates an edge with its parent resource, and adds it to the
-        crawler job queue if needed.
+        fetcher's URL queue if needed.
         """
         resource = self._store.find(Resource, Resource.url == url).one()
         if resource is None:
@@ -462,7 +433,7 @@ class CrawlManager(object):
             self._store.flush()
             LOGGER.debug("resource {} not fetched yet, creating a new job"
                          .format(resource.id))
-            self._crawler.add_job(resource.id, url)
+            self._fetcher.add_url(resource.id, url)
         if parent_id is not None:
             # Add an edge.
             LOGGER.debug("adding edge between {} and {}"
@@ -471,7 +442,7 @@ class CrawlManager(object):
         self._store.commit()
 
     def _handle_result(self, key, result):
-        """Handle a result (HTTP response) from the crawler.
+        """Handle a result (HTTP response) from the fetcher.
 
         Includes updating the corresponding entry in the database, writing the
         response to disk, and extracting further URLs to crawl.
