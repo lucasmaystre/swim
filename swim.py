@@ -181,75 +181,6 @@ class Edge(Storm):
         self.dst = dst
 
 
-class SwimQueue(Queue.Queue):
-
-    """A Queue.Queue that's picklable and rate-limited.
-
-    Queue.Queue is not picklable (for good reasons). This class fixes that for
-    swim's specific use. Rate limiting is also implemented directly here; the
-    rate limit is respected over a one minute window.
-    """
-    # TODO So far this class is pretty simple. In the future, it might become
-    # better to wrap Queue.Queue (decorator pattern) instead of subclassing it.
-
-    def __init__(self, rate_limit=None):
-        """Initialize the queue.
-
-        If rate_limit is a positive number, it represents the rate (items per
-        second) at which items can be retrieved.
-        """
-        Queue.Queue.__init__(self, maxsize=0)
-        self.rate_limit = rate_limit
-        self._tstamps = list()
-        self._lock = threading.Lock()
-
-    def __getstate__(self):
-        """Return a representation of the instance as a list."""
-        items = [self.rate_limit]
-        while not self.empty():
-            items.append(self._get())
-        return items
-
-    def __setstate__(self, state):
-        """Restore the instance from a list representation."""
-        # First element is the rate limit, the rest are the items.
-        self.__init__(rate_limit=state.pop(0))
-        for item in state:
-            self._put(item)
-            self.unfinished_tasks += 1
-
-    def get(self, timeout):
-        """Get an element from the queue.
-
-        An item is returned if and only if 1) the caller can acquire the lock,
-        2) the rate limit is not exceeded and 3) there is an element in the
-        queue. In any other case, the call blocks for timeout seconds and
-        raises Queue.Empty.
-        """
-        assert timeout >= 0, "timeout must be non-negative"
-        if self.rate_limit is None:
-            return Queue.Queue.get(self, timeout=timeout)
-        if self._lock.acquire(False):
-            try:
-                if not self._rate_limit_exceeded():
-                    item = Queue.Queue.get(self, timeout=timeout)
-                    self._tstamps.append(time.time())
-                    return item
-            finally:
-                self._lock.release()
-        time.sleep(timeout)
-        raise Queue.Empty()
-
-    def _rate_limit_exceeded(self):
-        """Compute the time remaining until the next element can be fetched."""
-        assert self.rate_limit > 0, "rate limit must be positive"
-        minute_ago = time.time() - 60
-        # Remove outdated timestamps.
-        while self._tstamps and self._tstamps[0] < minute_ago:
-            self._tstamps.pop(0)
-        return len(self._tstamps) / 60.00 >= self.rate_limit
-
-
 class Worker(threading.Thread):
 
     """Worker thread.
@@ -258,23 +189,24 @@ class Worker(threading.Thread):
     puts the result in the output queue.
     """
 
-    INPUT_TIMEOUT = 1  # In seconds.
+    TIMEOUT = 1  # In seconds.
 
-    def __init__(self, inputq, outputq):
+    def __init__(self, inputq, outputq, interval=None):
         """Initialize the thread with two queues."""
         threading.Thread.__init__(self)
         self._inputq = inputq
         self._outputq = outputq
         self._shutdown = False
         self._session = requests.Session()
+        self._interval = interval
         LOGGER.debug('initializing worker thread')
 
     def run(self):
         """Fetch jobs from the input queue ad infinitum."""
         while not self._shutdown:
-            self._is_working = False
+            start = time.time()
             try:
-                key, url = self._inputq.get(timeout=self.INPUT_TIMEOUT)
+                key, url = self._inputq.get(timeout=self.TIMEOUT)
                 LOGGER.debug("{}: got job {} ({})".format(self.name, key, url))
                 result = self._process(url)
                 self._outputq.put_nowait((key, result))
@@ -283,6 +215,11 @@ class Worker(threading.Thread):
                 LOGGER.debug("{}: done with job {}".format(self.name, key))
             except Queue.Empty:
                 pass
+            # Before fetching the next job, sleep a little.
+            elapsed = time.time() - start
+            while not self._shutdown and self._interval > elapsed:
+                time.sleep(min(self._interval - elapsed, self.TIMEOUT))
+                elapsed = time.time() - start
 
     def _process(self, url):
         """Process a single url: fetch it and parse the results."""
@@ -321,11 +258,11 @@ class Crawler(object):
     and output queues.
     """
 
-    def __init__(self, nb_workers=2, rate=None, inputq=None):
+    def __init__(self, nb_workers=2, rate=None):
         """Initialize a crawler."""
         self._nb_workers = nb_workers
-        self._rate = rate
-        self._inputq = inputq if inputq is not None else SwimQueue(rate)
+        self._rate = float(rate)
+        self._inputq = Queue.Queue()
         self._outputq = Queue.Queue()
         self._workers = list()
         self._started = False
@@ -336,8 +273,10 @@ class Crawler(object):
         """Recreate a crawler from a pickle."""
         with open(path, 'rb') as f:
             data = cPickle.load(f)
-            return cls(nb_workers=data['nb_workers'], rate=data['rate'],
-                       inputq=data['inputq'])
+            instance = cls(nb_workers=data['nb_workers'], rate=data['rate'])
+            for key, url in data['pending']:
+                instance.add_job(key, url)
+            return instance
 
     def add_job(self, key, url):
         """Add a URL to crawl.
@@ -360,8 +299,9 @@ class Crawler(object):
         LOGGER.debug("starting the crawler with {} workers"
                      .format(self._nb_workers))
         self._started = True
+        interval = self._nb_workers / self._rate
         for i in xrange(self._nb_workers):
-            worker = Worker(self._inputq, self._outputq)
+            worker = Worker(self._inputq, self._outputq, interval)
             self._workers.append(worker)
             worker.start()
 
@@ -386,10 +326,16 @@ class Crawler(object):
     def save_pickle(self, path):
         """Save the remaining jobs of the crawler as a pickle."""
         assert not self._started, "cannot save a running crawler"
+        pending = list()
+        try:
+            while True:
+                pending.append(self._inputq.get_nowait())
+        except Queue.Empty:
+            pass
         data = {
             'nb_workers': self._nb_workers,
             'rate': self._rate,
-            'inputq': self._inputq,
+            'pending': pending,
         }
         with open(path, 'wb') as f:
             cPickle.dump(data, f)
