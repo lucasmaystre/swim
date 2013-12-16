@@ -13,7 +13,7 @@ swim is minimalistic by design. There are plenty of powerful crawlers out
 there; the goal of this one is to provide a simple, no-frills basis that is
 easy to adapt to your needs.
 
-Here's a small snipper that illustrates the API.
+Here's a small snippet that illustrates the API.
 
     import re
     import swim
@@ -31,38 +31,6 @@ Here's a small snipper that illustrates the API.
     manager = swim.Manager(**config)
     manager.run(seeds=["http://lucas.maystre.ch/"])
 """
-# Assumptions & design decisions:
-#
-# - decoupling fetching URLs from processing the content
-# - new URLs to fetch can be determined solely by processing HTML output
-# - page = URL + GET params.
-# - GET requests only - no POST, etc.
-# - Output is response body only
-# - no cookies handling, form submissions, etc.
-#
-# Recovery: works only if it is able to gracefully shut down. The shutdown
-# procedure is as follows:
-#
-# 1. Set the shutdown flag and stop submitting new jobs to the executor.
-# 2. Wait until all jobs submitted to the executor are done (handled by a
-#    context manager.) This means that all pending requests are finished.
-# 3. Process everything in the output queue, possibly adding new URls to the
-#    input queue.
-# 4. Pickle the state of the fetcher (input queue + initialization params),
-#    commit and close the DB connection.
-#
-# A wish list of things TODO:
-#
-# - recover from crashes as well as graceful shutdowns.
-# - finish crawling the URLs in the input queue without creating new jobs. To
-#   make sure we could still expand the crawl, we could add a flag in the table
-#   which indicates whether the resource has been processed (i.e. new jobs
-#   extracted) or not.
-# - clean up the queues: the output queue should not be pickled anymore (it is
-#   empty at the end), so we could just use a regular Queue.Queue for that. As
-#   for the input queue, it might be simpler and more efficient to subclass /
-#   wrap `collections.deque` which also has atomic ops.
-# TODO: https://github.com/patrys/httmock
 
 
 import contextlib

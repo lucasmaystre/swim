@@ -6,6 +6,7 @@ import unittest
 # - http://docs.python.org/2/library/unittest.html
 # - https://nose.readthedocs.org/en/latest/
 # - http://www.voidspace.org.uk/python/mock/
+# - https://github.com/patrys/httmock
 
 # How to proceed: go over code an think about:
 # - what would be interesting to test
