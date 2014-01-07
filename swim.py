@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS edge (
   UNIQUE (src, dst) ON CONFLICT IGNORE
 );
 """
+UA_STRING = 'swim/1.0'
 
 
 def _setup_logger():
@@ -166,15 +167,17 @@ class Fetcher(threading.Thread):
 
     TIMEOUT = 1  # In seconds.
 
-    def __init__(self, max_workers=2, rate=100):
+    def __init__(self, max_workers=2, rate=100, ua_string=UA_STRING):
         """Initialize a fetcher."""
         super(Fetcher, self).__init__()
         self._max_workers = max_workers
         self._rate = rate
+        self._ua_string = ua_string
         self._in = Queue.Queue()
         self._out = Queue.Queue()
         self._shutdown = False
         self._session = requests.Session()
+        self._session.headers.update({'User-Agent': self._ua_string})
         if max_workers > requests.adapters.DEFAULT_POOLSIZE:
             # This is need as self._session might be called concurrently. See:
             # https://github.com/ross/requests-futures.
@@ -191,7 +194,8 @@ class Fetcher(threading.Thread):
         """Recreate a fetcher from a pickle."""
         with open(path, 'rb') as f:
             data = cPickle.load(f)
-            instance = cls(max_workers=data['max_workers'], rate=data['rate'])
+            instance = cls(max_workers=data['max_workers'], rate=data['rate'],
+                           ua_string=data['ua_string'])
             for key, url in data['pending']:
                 instance.add_url(key, url)
             return instance
@@ -231,6 +235,7 @@ class Fetcher(threading.Thread):
             'max_workers': self._max_workers,
             'rate': self._rate,
             'pending': list(iter(self._in.get_nowait, '♥')),
+            'ua_string': self._ua_string,
         }
         with open(path, 'wb') as f:
             cPickle.dump(data, f)
@@ -303,7 +308,7 @@ class Manager(object):
     """
 
     def __init__(self, folder="./swim", processor=None, fetcher_pickle=None,
-                 max_workers=2, rate=1.0):
+                 max_workers=2, rate=1.0, ua_string=UA_STRING):
         """Initialize a crawl manager.
 
         Keyword arguments:
@@ -322,7 +327,8 @@ class Manager(object):
         _ensure_folder(self._data_dir)
         self._process = processor
         if fetcher_pickle is None:
-            self._fetcher = Fetcher(max_workers=max_workers, rate=rate)
+            self._fetcher = Fetcher(max_workers=max_workers, rate=rate,
+                                    ua_string=ua_string)
         else:
             self._fetcher = Fetcher.from_pickle(fetcher_pickle)
         LOGGER.info("manager initialized")

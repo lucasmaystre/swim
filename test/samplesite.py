@@ -2,7 +2,7 @@
 import time
 import random
 
-from flask import Flask, redirect, abort, url_for
+from flask import Flask, redirect, abort, url_for, request
 
 
 app = Flask(__name__)
@@ -32,6 +32,7 @@ def gen_page(title, links):
 
 @app.before_request
 def delay():
+    #print request.headers.get('User-Agent')
     time.sleep(random.uniform(2, 4))
 
 

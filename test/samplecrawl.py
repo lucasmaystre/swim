@@ -8,6 +8,7 @@ DEFAULT_FOLDER = "./test"
 DEFAULT_SEED = u"http://127.0.0.1:5000/"
 
 URL_RE = re.compile(r'<a.*?href="(?P<url>.*?)">')
+UA_STRING = "Mozilla/5.0 (X11; Linux x86_64) Gecko Firefox/5.0"
 
 
 def process(body):
@@ -18,7 +19,8 @@ def process(body):
 def main(args):
     swim.set_loglevel(args.loglevel)
     if args.pickle is None:
-        mgr = swim.Manager(args.folder, processor=process, rate=0.2)
+        mgr = swim.Manager(args.folder, processor=process, rate=0.2,
+                           ua_string=UA_STRING)
         mgr.run(seeds=[DEFAULT_SEED])
     else:
         mgr = swim.Manager(args.folder, processor=process,
