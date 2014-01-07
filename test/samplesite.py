@@ -41,7 +41,7 @@ def homepage():
     links.append("/404")
     links.append("/500")
     links.append("/redirect")
-    links.append("htt://google.com")
+    links.append("htt://google.com/#frag")
     links.append("http://domain-that-does-not.exist")
     return gen_page("Homepage", links)
 

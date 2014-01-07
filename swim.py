@@ -33,6 +33,7 @@ Here's a small snippet that illustrates the API.
 """
 
 
+import codecs
 import contextlib
 import cPickle
 import datetime
@@ -431,11 +432,13 @@ class Manager(object):
                          .format(key))
             # Save the file to disk.
             path = os.path.join(self._data_dir, "{}.html".format(resource.id))
-            with open(path, 'w') as f:
+            with codecs.open(path, 'w', encoding='utf8') as f:
                 f.write(result['body'])
             # Extract more jobs.
             if self._process is not None:
                 for url in self._process(result['body']):
                     # urljoin handles all quirky cases of URL resolution.
                     canonical = urlparse.urljoin(resource.final_url, url)
+                    # Get rid of any fragment (we have to do it ourselves...)
+                    canonical = canonical.split('#', 1)[0]
                     self._add_resource(canonical, resource.id)
