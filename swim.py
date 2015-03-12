@@ -183,10 +183,10 @@ class Fetcher(threading.Thread):
             # https://github.com/ross/requests-futures.
             kwargs = {'pool_connections': max_workers,
                       'pool_maxsize': max_workers}
-            self._session._mount('https://',
-                                 requests.adapters.HTTPAdapter(**kwargs))
-            self._session._mount('http://',
-                                 requests.adapters.HTTPAdapter(**kwargs))
+            self._session.mount('https://',
+                                requests.adapters.HTTPAdapter(**kwargs))
+            self._session.mount('http://',
+                                requests.adapters.HTTPAdapter(**kwargs))
         LOGGER.debug('fetcher initialized')
 
     @classmethod
